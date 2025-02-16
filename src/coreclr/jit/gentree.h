@@ -3586,7 +3586,7 @@ private:
     }
 };
 
-// Common supertype of [STORE_]LCL_VAR, [STORE_]LCL_FLD, PHI_ARG, LCL_VAR_ADDR, LCL_FLD_ADDR.
+// Common supertype of [STORE_]LCL_VAR, [STORE_]LCL_FLD, PHI_ARG, LCL_ADDR.
 // This inherits from UnOp because lclvar stores are unary.
 //
 struct GenTreeLclVarCommon : public GenTreeUnOp
@@ -4227,6 +4227,7 @@ enum GenTreeCallFlags : unsigned int
     GTF_CALL_M_CAST_CAN_BE_EXPANDED    = 0x04000000, // this cast (helper call) can be expanded if it's profitable. To be removed.
     GTF_CALL_M_CAST_OBJ_NONNULL        = 0x08000000, // if we expand this specific cast we don't need to check the input object for null
                                                      // NOTE: if needed, this flag can be removed, and we can introduce new _NONNUL cast helpers
+    GTF_CALL_M_STACK_ARRAY             = 0x10000000, // this call is a new array helper for a stack allocated array.
 };
 
 inline constexpr GenTreeCallFlags operator ~(GenTreeCallFlags a)
@@ -4566,6 +4567,7 @@ enum class WellKnownArg : unsigned
     SwiftError,
     SwiftSelf,
     X86TailCallSpecialArg,
+    StackArrayLocal,
 };
 
 #ifdef DEBUG
@@ -4579,7 +4581,6 @@ struct CallArgABIInformation
         , ByteOffset(0)
         , ByteSize(0)
         , ArgType(TYP_UNDEF)
-        , PassedByRef(false)
 #if FEATURE_ARG_SPLIT
         , m_isSplit(false)
 #endif
@@ -4609,8 +4610,6 @@ public:
     // that type. Note that if a struct is passed by reference, this will still
     // be the struct type.
     var_types ArgType : 5;
-    // True iff the argument is passed by reference.
-    bool PassedByRef : 1;
 
 private:
 #if FEATURE_ARG_SPLIT
@@ -4858,14 +4857,6 @@ public:
 
 #ifdef DEBUG
     void Dump(Compiler* comp);
-    // Check that the value of 'AbiInfo.IsStruct' is consistent.
-    // A struct arg must be one of the following:
-    // - A node of struct type,
-    // - A GT_FIELD_LIST, or
-    // - A node of a scalar type, passed in a single register or slot
-    //   (or two slots in the case of a struct pass on the stack as TYP_DOUBLE).
-    //
-    void CheckIsStruct();
 #endif
 };
 
@@ -4918,6 +4909,7 @@ public:
     CallArg* GetArgByIndex(unsigned index);
     CallArg* GetUserArgByIndex(unsigned index);
     unsigned GetIndex(CallArg* arg);
+    unsigned GetUserIndex(CallArg* arg);
 
     bool IsEmpty() const
     {
@@ -7586,12 +7578,12 @@ private:
 
 public:
     GenTreeArrAddr(GenTree* addr, var_types elemType, CORINFO_CLASS_HANDLE elemClassHandle, uint8_t firstElemOffset)
-        : GenTreeUnOp(GT_ARR_ADDR, TYP_BYREF, addr DEBUGARG(/* largeNode */ false))
+        : GenTreeUnOp(GT_ARR_ADDR, addr->TypeGet(), addr DEBUGARG(/* largeNode */ false))
         , m_elemClassHandle(elemClassHandle)
         , m_elemType(elemType)
         , m_firstElemOffset(firstElemOffset)
     {
-        assert(addr->TypeIs(TYP_BYREF));
+        assert(addr->TypeIs(TYP_BYREF, TYP_I_IMPL));
         assert(((elemType == TYP_STRUCT) && (elemClassHandle != NO_CLASS_HANDLE)) ||
                (elemClassHandle == NO_CLASS_HANDLE));
     }
@@ -7941,6 +7933,7 @@ struct GenTreeIndir : public GenTreeOp
         return gtOp2;
     }
 
+    bool     IsAddressNotOnHeap(Compiler* comp);
     bool     HasBase();
     bool     HasIndex();
     GenTree* Base();
@@ -9522,7 +9515,71 @@ enum insCflags : unsigned
     INS_FLAGS_NZC,
     INS_FLAGS_NZCV,
 };
+#elif defined(TARGET_XARCH)
+enum insCflags : unsigned
+{
+    INS_FLAGS_NONE = 0x0,
+    INS_FLAGS_CF   = 0x1,
+    INS_FLAGS_ZF   = 0x2,
+    INS_FLAGS_SF   = 0x4,
+    INS_FLAGS_OF   = 0x8
+};
 
+// todo-apx-xarch : this data structure might not be necessary, but nice to have the CC
+// encoded somewhere
+enum insCC : unsigned
+{
+    INS_CC_O = 0x0, // OF = 1
+
+    INS_CC_NO = 0x1, // OF = 0
+
+    INS_CC_B   = 0x2, // CF = 1
+    INS_CC_C   = 0x2, // CF = 1
+    INS_CC_NAE = 0x2, // CF = 1
+
+    INS_CC_NB = 0x3, // CF = 0
+    INS_CC_NC = 0x3, // CF = 0
+    INS_CC_AE = 0x3, // CF = 0
+
+    INS_CC_E = 0x4, // ZF = 1
+    INS_CC_Z = 0x4, // ZF = 1
+
+    INS_CC_NE = 0x5, // ZF = 0
+    INS_CC_NZ = 0x5, // ZF = 0
+
+    INS_CC_BE = 0x6, // (CF OR ZF) = 1
+    INS_CC_NA = 0x6, // (CF OR ZF) = 1
+
+    INS_CC_NBE = 0x7, // (CF OR ZF) = 0
+    INS_CC_A   = 0x7, // (CF OR ZF) = 0
+
+    INS_CC_S = 0x8, // (SF = 1)
+
+    INS_CC_NS = 0x9, // (SF = 0)
+
+    // no parity flag in ccmp/ctest
+
+    // 0b1010 special always evals to true
+    INS_CC_TRUE = 0xA,
+
+    // 0b1011 special always evals to false
+    INS_CC_FALSE = 0xB,
+
+    INS_CC_L   = 0xC, // (SF XOR OF) = 1
+    INS_CC_NGE = 0xC, // (SF XOR OF) = 1
+
+    INS_CC_NL = 0xD, // (SF XOR OF) = 0
+    INS_CC_GE = 0xD, // (SF XOR OF) = 0
+
+    INS_CC_LE = 0xE, // (SF XOR OF) OR ZF) = 1
+    INS_CC_NG = 0xE, // (SF XOR OF) OR ZF) = 1
+
+    INS_CC_NLE = 0xF, // (SF XOR OF) OR ZF) = 0
+    INS_CC_G   = 0xF, // (SF XOR OF) OR ZF) = 0
+};
+#endif
+
+#if defined(TARGET_ARM64)
 struct GenTreeCCMP final : public GenTreeOpCC
 {
     insCflags gtFlagsVal;
